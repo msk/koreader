@@ -26,22 +26,79 @@ local T = require("ffi/util").template
 
 local Deinflector = {}
 
-local RULE_TYPES = {
-    ["v1"]    = 0x01, -- Verb ichidan (so-called ru-verb)
-    ["v5"]    = 0x02, -- Verb godan (so-called u-verb)
-    ["vs"]    = 0x04, -- Verb suru
-    ["vk"]    = 0x08, -- Verb kuru
-    ["vz"]    = 0x0A, -- Verb zuru
-    ["adj-i"] = 0x10, -- Adjectival verb (i-adjective)
-    ["iru"]   = 0x20, -- Intermediate -iru endings for progressive or perfect tense
+-- Yomitan-style condition tree. Leaf nodes get unique bit flags; parent nodes
+-- get the OR of their children's flags. This replaces the old hardcoded
+-- RULE_TYPES table and automatically prevents bitmask collision bugs.
+local CONDITION_TREE = {
+    -- Parent: any verb
+    v     = { subConditions = {"v1", "v5", "vk", "vs", "vz"} },
+    -- Ichidan verbs (ru-verbs)
+    v1    = { subConditions = {"v1d", "v1p"} },
+    v1d   = {}, -- ichidan dictionary form
+    v1p   = {}, -- ichidan progressive/perfect form (~てる・でる)
+    -- Godan verbs (u-verbs)
+    v5    = { subConditions = {"v5d", "v5s"} },
+    v5d   = {}, -- godan dictionary form
+    v5s   = { subConditions = {"v5ss", "v5sp"} },
+    v5ss  = {}, -- short causative ~さす (cannot conjugate with passive)
+    v5sp  = {}, -- short causative ~す (can conjugate with passive)
+    -- Irregular verbs
+    vk    = {}, -- kuru verb
+    vs    = {}, -- suru verb
+    vz    = {}, -- zuru verb
+    -- Adjective
+    ["adj-i"] = {},
+    -- Intermediate conditions for chaining
+    iru   = {}, -- legacy: intermediate for progressive/perfect tense
 }
+
+--- Build a condition-name-to-bitmask map from the condition tree.
+-- Leaf nodes get unique bit positions (1 << index). Parent nodes with
+-- subConditions get the bitwise OR of all their children's flags.
+local function buildConditionFlags(tree)
+    local flags = {}
+    local nextBit = 0
+    -- First pass: assign unique bits to leaf nodes.
+    for name, cond in pairs(tree) do
+        if not cond.subConditions then
+            flags[name] = bit.lshift(1, nextBit)
+            nextBit = nextBit + 1
+        end
+    end
+    -- Iteratively resolve parent nodes.
+    local changed = true
+    while changed do
+        changed = false
+        for name, cond in pairs(tree) do
+            if cond.subConditions and not flags[name] then
+                local combined = 0
+                local allResolved = true
+                for _, child in ipairs(cond.subConditions) do
+                    if flags[child] then
+                        combined = bit.bor(combined, flags[child])
+                    else
+                        allResolved = false
+                        break
+                    end
+                end
+                if allResolved then
+                    flags[name] = combined
+                    changed = true
+                end
+            end
+        end
+    end
+    return flags
+end
+
+local CONDITION_FLAGS = buildConditionFlags(CONDITION_TREE)
 
 local function toRuleTypes(...)
     local final = 0
     for i = 1, select("#", ...) do
         local ruleType = select(i, ...)
-        if RULE_TYPES[ruleType] then
-            final = bit.bor(final, RULE_TYPES[ruleType])
+        if CONDITION_FLAGS[ruleType] then
+            final = bit.bor(final, CONDITION_FLAGS[ruleType])
         end
     end
     return final
