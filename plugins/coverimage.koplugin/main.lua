@@ -78,7 +78,17 @@ function CoverImage:init()
     self.cover_image_quality = G_reader_settings:readSetting("cover_image_quality", 75)
     self.cover_image_grayscale = G_reader_settings:isTrue("cover_image_grayscale")
     self.cover_image_stretch_limit = G_reader_settings:readSetting("cover_image_stretch_limit", 8)
+    self.cover_image_fit_mode = G_reader_settings:readSetting("cover_image_fit_mode", "centered")
+    if self.cover_image_fit_mode ~= "centered" and self.cover_image_fit_mode ~= "top_reflection" then
+        self.cover_image_fit_mode = "centered"
+    end
     self.cover_image_background = G_reader_settings:readSetting("cover_image_background", "black")
+    if self.cover_image_background ~= "black"
+        and self.cover_image_background ~= "white"
+        and self.cover_image_background ~= "gray"
+        and self.cover_image_background ~= "none" then
+        self.cover_image_background = "black"
+    end
     self.cover_image_rotate = G_reader_settings:readSetting("cover_image_rotate", true)
     self.cover_image_fallback_path = G_reader_settings:readSetting("cover_image_fallback_path",
         default_fallback_path)
@@ -192,13 +202,68 @@ function CoverImage:createCoverImage(doc_settings)
         cover_image = RenderImage:scaleBlitBuffer(cover_image, scaled_w, scaled_h)
         -- new buffer with screen dimensions,
         image = Blitbuffer.new(s_w, s_h, cover_image:getType()) -- new buffer, filled with black
-        if self.cover_image_background == "white" then
+        local cover_x = math.floor((s_w - scaled_w) / 2)
+        if self.cover_image_fit_mode == "top_reflection" then
+            -- Reflection mode is independent from selectable background colors.
             image:fill(Blitbuffer.COLOR_WHITE)
-        elseif self.cover_image_background == "gray" then
-            image:fill(Blitbuffer.COLOR_GRAY)
+            local cover_y = 0
+            -- Keep the cover aligned at the top and fill any bottom gap with a soft reflection.
+            image:blitFrom(cover_image, cover_x, cover_y, 0, 0, scaled_w, scaled_h)
+
+            local gap_h = s_h - scaled_h
+            if gap_h > 0 then
+                local reflection_src_h = math.min(gap_h, math.max(1, math.floor(scaled_h * 0.35)))
+                local reflection_src = Blitbuffer.new(scaled_w, reflection_src_h, cover_image:getType())
+
+                -- Build a vertically mirrored strip from the bottom of the cover.
+                for y = 0, reflection_src_h - 1 do
+                    reflection_src:blitFrom(cover_image, 0, y, 0, scaled_h - y - 1, scaled_w, 1)
+                end
+
+                local reflection = RenderImage:scaleBlitBuffer(reflection_src, scaled_w, gap_h)
+                reflection_src:free()
+
+                -- Keep this stronger than usual UI blends: on e-ink, low-alpha over black can look fully black.
+                local max_intensity = 0.45
+                local min_intensity = 0.10
+                local den = math.max(1, gap_h - 1)
+                for y = 0, gap_h - 1 do
+                    local t = y / den
+                    local intensity = min_intensity + (max_intensity - min_intensity) * (1 - t) * (1 - t)
+                    image:addblitFrom(reflection, cover_x, scaled_h + y, 0, y, scaled_w, 1, intensity)
+                end
+                reflection:free()
+
+                -- Draw a subtle seam between cover and reflection based on the cover edge tone.
+                local sample_rows = math.min(2, scaled_h)
+                local sample_sum = 0
+                for row = 0, sample_rows - 1 do
+                    local src_y = scaled_h - 1 - row
+                    for x = 0, scaled_w - 1 do
+                        sample_sum = sample_sum + cover_image:getPixel(x, src_y):getColor8().a
+                    end
+                end
+                local edge_luma = math.floor(sample_sum / (scaled_w * sample_rows))
+                local seam_dark = math.max(0, edge_luma - 0x14)
+                local seam_light = math.max(0, math.min(0xFF, edge_luma - 0x06))
+                image:paintRect(cover_x, scaled_h, scaled_w, 1, Blitbuffer.Color8(seam_dark))
+                if scaled_h + 1 < s_h then
+                    image:paintRect(cover_x, scaled_h + 1, scaled_w, 1, Blitbuffer.Color8(seam_light))
+                end
+            end
+        else
+            if self.cover_image_background == "white" then
+                image:fill(Blitbuffer.COLOR_WHITE)
+            elseif self.cover_image_background == "gray" then
+                image:fill(Blitbuffer.COLOR_GRAY)
+            end
+            -- copy scaled image to buffer
+            if s_w > scaled_w then -- move right
+                image:blitFrom(cover_image, cover_x, 0, 0, 0, scaled_w, scaled_h)
+            else -- move down
+            image:blitFrom(cover_image, 0, math.floor((s_h - scaled_h) / 2), 0, 0, scaled_w, scaled_h)
         end
-        -- center scaled image on both axes
-        image:blitFrom(cover_image, math.floor((s_w - scaled_w) / 2), math.floor((s_h - scaled_h) / 2), 0, 0, scaled_w, scaled_h)
+    end
     end
 
     cover_image:free()
@@ -260,7 +325,8 @@ function CoverImage:getCacheFile(custom_cover)
 
     -- use document_name here. Title may contain characters not allowed on every filesystem (esp. vfat on /sdcard)
     local key = document_name .. custom_cover_mtime .. self.cover_image_quality .. self.cover_image_stretch_limit
-        .. self.cover_image_background .. self.cover_image_format .. tostring(self.cover_image_grayscale)
+        .. self.cover_image_background .. self.cover_image_fit_mode
+        .. self.cover_image_format .. tostring(self.cover_image_grayscale)
         .. Screen:getRotationMode() .. rotated
 
     return self.cover_image_cache_path .. self.cover_image_cache_prefix .. md5(key) .. "." .. getExtension(self.cover_image_path)
@@ -646,6 +712,9 @@ end
 function CoverImage:menuEntryBackground(color, color_translatable)
     return {
         text = T(_("Fit to screen, %1 background"), _(color_translatable)),
+        enabled_func = function()
+            return self.cover_image_fit_mode ~= "top_reflection"
+        end,
         checked_func = function()
             return self.cover_image_background == color
         end,
@@ -654,6 +723,25 @@ function CoverImage:menuEntryBackground(color, color_translatable)
             self.cover_image_background = color
             G_reader_settings:saveSetting("cover_image_background", self.cover_image_background)
             if self:coverEnabled() and old_background ~= self.cover_image_background then
+                self:createCoverImage(self.ui.doc_settings)
+            end
+        end,
+    }
+end
+
+function CoverImage:menuEntryFitMode(mode, label, help_text)
+    return {
+        text = label,
+        keep_menu_open = true,
+        help_text = help_text,
+        checked_func = function()
+            return self.cover_image_fit_mode == mode
+        end,
+        callback = function()
+            local old_mode = self.cover_image_fit_mode
+            self.cover_image_fit_mode = mode
+            G_reader_settings:saveSetting("cover_image_fit_mode", self.cover_image_fit_mode)
+            if self:coverEnabled() and old_mode ~= self.cover_image_fit_mode then
                 self:createCoverImage(self.ui.doc_settings)
             end
         end,
@@ -684,6 +772,10 @@ function CoverImage:menuEntrySBF()
                     self:sizeSpinner(touchmenu_instance, "cover_image_stretch_limit", _("Set stretch threshold"), 0, 20, 8, createCover, "%")
                 end,
             },
+            self:menuEntryFitMode("centered", _("Fit layout: centered"),
+                _("Center the scaled cover and fill top/bottom margins with the selected background color.")),
+            self:menuEntryFitMode("top_reflection", _("Fit layout: top + reflection"),
+                _("Place the scaled cover at the top and fill the bottom margin with a faded reflection.")),
             self:menuEntryBackground("black", _("black")),
             self:menuEntryBackground("white", _("white")),
             self:menuEntryBackground("gray", _("gray")),
